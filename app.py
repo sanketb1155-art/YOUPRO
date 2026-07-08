@@ -1,9 +1,11 @@
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 import random
 import time
 import logging
 from functools import wraps
 from collections import OrderedDict
+import yt_dlp
+import requests
 
 app = Flask(__name__)
 
@@ -16,23 +18,19 @@ PIPED_PROXIES = [
     "https://pipedapi.rivo.lol",
 ]
 
-# Simple in-memory cache with TTL
 cache = OrderedDict()
 MAX_CACHE_SIZE = 200
-CACHE_TTL = 600  # 10 minutes
+CACHE_TTL = 600
 
-# Rate limiting
 rate_limit_store = {}
-RATE_LIMIT = 30  # requests per minute
+RATE_LIMIT = 40
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Stats
 stats = {'requests': 0, 'cache_hits': 0, 'errors': 0, 'start_time': time.time()}
 
-# ==================== CACHE ====================
+# ==================== CACHE & RATE LIMIT ====================
 def get_cache(key):
     if key in cache:
         value, expiry = cache[key]
@@ -48,11 +46,10 @@ def set_cache(key, value, ttl=CACHE_TTL):
         cache.popitem(last=False)
     cache[key] = (value, time.time() + ttl)
 
-# ==================== RATE LIMITER ====================
 def rate_limit(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        client_ip = request.remote_addr
+        client_ip = request.remote_addr or 'unknown'
         now = time.time()
         if client_ip in rate_limit_store:
             requests_made = [t for t in rate_limit_store[client_ip] if now - t < 60]
@@ -65,235 +62,117 @@ def rate_limit(f):
         return f(*args, **kwargs)
     return decorated
 
-# ==================== ROUTES ====================
-@app.route('/')
-def home():
-    return jsonify({
-        'name': 'YouPro API Pro',
-        'version': '10.0',
-        'endpoints': ['/api/status', '/api/trending', '/api/video/search', '/api/video/info', '/api/video/formats', '/api/video/related', '/api/download']
-    })
-
-@app.route('/api/status')
-def status():
-    return jsonify({
-        'status': 'online',
-        'uptime': int(time.time() - stats['start_time']),
-        'requests': stats['requests'],
-        'cache_hits': stats['cache_hits'],
-        'errors': stats['errors'],
-        'proxies_alive': len(PIPED_PROXIES)
-    })
-
-# ==================== TRENDING ====================
-@app.route('/api/trending')
-@rate_limit
-def trending():
-    stats['requests'] += 1
-    region = request.args.get('region', 'IN')
-    cache_key = f"trending_{region}"
-    cached = get_cache(cache_key)
-    if cached:
-        return jsonify(cached)
-
-    try:
-        import yt_dlp
-        ydl_opts = {'quiet': True, 'extract_flat': 'in_playlist', 'skip_download': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/feed/trending?gl={region}", download=False)
-            videos = []
-            for e in info.get('entries', [])[:30]:
-                if e:
-                    videos.append({
-                        'id': e['id'], 'title': e.get('title',''), 'channel': e.get('uploader',''),
-                        'duration': e.get('duration',0), 'views': e.get('view_count',0),
-                        'thumbnail': (e.get('thumbnails',[{}])[-1].get('url',''))
-                    })
-            result = {'success': True, 'videos': videos, 'count': len(videos)}
-            set_cache(cache_key, result, 1800)
-            return jsonify(result)
-    except Exception as e:
-        stats['errors'] += 1
-        logger.error(f"Trending error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-# ==================== SEARCH ====================
-@app.route('/api/video/search')
-@rate_limit
-def search():
-    stats['requests'] += 1
-    query = request.args.get('q', 'trending')
-    page = int(request.args.get('page', 1))
-    per_page = min(int(request.args.get('per_page', 30)), 100)
-    
-    cache_key = f"search_{query}_{page}_{per_page}"
-    cached = get_cache(cache_key)
-    if cached:
-        return jsonify(cached)
-
-    try:
-        import yt_dlp
-        ydl_opts = {'quiet': True, 'extract_flat': 'in_playlist', 'skip_download': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{per_page*page}:{query}", download=False)
-            all_v = []
-            for e in info.get('entries', []):
-                if e:
-                    all_v.append({
-                        'id': e['id'], 'title': e.get('title',''), 'channel': e.get('uploader',''),
-                        'duration': e.get('duration',0), 'thumbnail': (e.get('thumbnails',[{}])[-1].get('url',''))
-                    })
-            s = (page-1)*per_page
-            result = {'success': True, 'videos': all_v[s:s+per_page], 'has_next': len(all_v) > s+per_page}
-            set_cache(cache_key, result, 600)
-            return jsonify(result)
-    except Exception as e:
-        stats['errors'] += 1
-        logger.error(f"Search error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-# ==================== VIDEO INFO ====================
-@app.route('/api/video/info')
-@rate_limit
-def video_info():
-    stats['requests'] += 1
-    video_id = request.args.get('id', '')
-    if not video_id: return jsonify({'success': False, 'error': 'Missing ID'})
-
-    cache_key = f"info_{video_id}"
-    cached = get_cache(cache_key)
-    if cached:
-        return jsonify(cached)
-
-    try:
-        import yt_dlp
-        ydl_opts = {'quiet': True, 'extract_flat': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://youtube.com/watch?v={video_id}", download=False)
-            result = {
-                'success': True,
-                'title': info.get('title',''),
-                'channel': info.get('uploader',''),
-                'duration': info.get('duration',0),
-                'views': info.get('view_count',0),
-                'likes': info.get('like_count',0),
-                'thumbnail': info.get('thumbnail',''),
-                'description': (info.get('description','') or '')[:300]
-            }
-            set_cache(cache_key, result, 3600)
-            return jsonify(result)
-    except Exception as e:
-        stats['errors'] += 1
-        return jsonify({'success': False, 'error': str(e)})
-
-# ==================== FORMATS ====================
+# ==================== MAIN FORMATS ENDPOINT (Best Version) ====================
 @app.route('/api/video/formats')
 @rate_limit
 def formats():
     stats['requests'] += 1
-    video_id = request.args.get('id', '')
-    quality = request.args.get('quality', '720p')
-    if not video_id: return jsonify({'success': False})
+    video_id = request.args.get('id', '').strip()
+    if not video_id:
+        return jsonify({'success': False, 'error': 'Missing video ID'})
 
     cache_key = f"formats_{video_id}"
     cached = get_cache(cache_key)
     if cached:
         return jsonify(cached)
 
+    result = None
+
+    # === Layer 1: yt_dlp (Most Reliable) ===
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'extractor_retries': 3,
+            'socket_timeout': 12,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            
+            formats_list = []
+            for f in info.get('formats', []):
+                if f.get('vcodec') != 'none' and f.get('url') and f.get('height', 0) >= 144:
+                    formats_list.append({
+                        'url': f['url'],
+                        'quality': f"{f.get('height')}p",
+                        'height': f.get('height'),
+                    })
+            
+            if formats_list:
+                formats_list = sorted(formats_list, key=lambda x: x['height'], reverse=True)
+                result = {
+                    'success': True,
+                    'title': info.get('title', 'Video'),
+                    'formats': formats_list[:8],
+                    'source': 'yt_dlp'
+                }
+                set_cache(cache_key, result)
+                return jsonify(result)
+    except Exception as e:
+        logger.warning(f"yt_dlp failed: {e}")
+
+    # === Layer 2: Piped Proxies Fallback ===
     proxies = list(PIPED_PROXIES)
     random.shuffle(proxies)
-
+    
     for proxy in proxies:
         try:
-            import requests as r
-            resp = r.get(f"{proxy}/streams/{video_id}", timeout=10, headers={'User-Agent': 'YouPro/10.0'})
-            if resp.status_code != 200: continue
+            resp = requests.get(
+                f"{proxy}/streams/{video_id}", 
+                timeout=10,
+                headers={'User-Agent': 'YouPro/10.0'}
+            )
+            if resp.status_code != 200:
+                continue
+                
             data = resp.json()
             fmts = []
             for s in data.get('videoStreams', []):
-                url = s.get('url', '')
-                if url:
-                    fmts.append({'url': url, 'quality': s.get('quality',''), 'height': s.get('height',720)})
+                if s.get('url'):
+                    fmts.append({
+                        'url': s['url'],
+                        'quality': s.get('quality', '720p'),
+                        'height': s.get('height', 720)
+                    })
+            
             if fmts:
-                result = {'success': True, 'title': data.get('title',''), 'formats': fmts, 'proxy': proxy}
+                fmts = sorted(fmts, key=lambda x: x['height'], reverse=True)
+                result = {
+                    'success': True,
+                    'title': data.get('title', 'Video'),
+                    'formats': fmts,
+                    'source': 'piped'
+                }
                 set_cache(cache_key, result, 300)
                 return jsonify(result)
         except Exception as e:
-            logger.warning(f"Proxy {proxy} failed: {e}")
+            logger.warning(f"Proxy {proxy} failed: {str(e)[:100]}")
             continue
 
+    # === Final Failure ===
     stats['errors'] += 1
-    return jsonify({'success': False, 'error': 'All proxies failed'})
+    error_result = {'success': False, 'error': 'All extraction methods failed. Try again later.'}
+    set_cache(cache_key, error_result, 60)
+    return jsonify(error_result)
 
-# ==================== RELATED ====================
-@app.route('/api/video/related')
-@rate_limit
-def related():
-    stats['requests'] += 1
-    video_id = request.args.get('id', '')
-    if not video_id: return jsonify({'success': False})
 
-    cache_key = f"related_{video_id}"
-    cached = get_cache(cache_key)
-    if cached:
-        return jsonify(cached)
+# Other routes (status, trending, etc.) same rakh sakte ho...
 
-    for proxy in random.sample(PIPED_PROXIES, 3):
-        try:
-            import requests as r
-            resp = r.get(f"{proxy}/streams/{video_id}", timeout=10)
-            if resp.status_code != 200: continue
-            data = resp.json()
-            related_vids = data.get('relatedStreams', [])[:15]
-            result = {'success': True, 'videos': [{'id': v.get('url','').split('=')[-1], 'title': v.get('title',''), 'channel': v.get('uploaderName',''), 'thumbnail': v.get('thumbnail','')} for v in related_vids]}
-            set_cache(cache_key, result, 1800)
-            return jsonify(result)
-        except: continue
+@app.route('/')
+def home():
+    return jsonify({'status': 'online', 'message': 'YouPro Backend - Multi Layer Extraction Active'})
 
-    return jsonify({'success': False, 'error': 'Failed'})
-
-# ==================== DOWNLOAD ====================
-@app.route('/api/download')
-@rate_limit
-def download():
-    stats['requests'] += 1
-    video_id = request.args.get('id', '')
-    quality = request.args.get('quality', 'best')
-    if not video_id: return jsonify({'success': False})
-
-    for proxy in random.sample(PIPED_PROXIES, 3):
-        try:
-            import requests as r
-            resp = r.get(f"{proxy}/streams/{video_id}", timeout=10)
-            if resp.status_code != 200: continue
-            data = resp.json()
-            for s in data.get('videoStreams', []):
-                if s.get('quality','') == quality or quality == 'best':
-                    return jsonify({'success': True, 'download_url': s.get('url',''), 'title': data.get('title',''), 'quality': s.get('quality','')})
-        except: continue
-
-    return jsonify({'success': False, 'error': 'No download link found'})
-
-# ==================== PROXY HEALTH ====================
 @app.route('/api/proxy/health')
 def proxy_health():
     results = {}
     for proxy in PIPED_PROXIES:
         try:
-            import requests as r
-            resp = r.get(f"{proxy}/streams/dQw4w9WgXcQ", timeout=5)
-            results[proxy] = 'alive' if resp.status_code == 200 else f'status_{resp.status_code}'
+            resp = requests.get(f"{proxy}/streams/dQw4w9WgXcQ", timeout=6)
+            results[proxy] = 'alive' if resp.status_code == 200 else f'error_{resp.status_code}'
         except:
             results[proxy] = 'dead'
     return jsonify({'success': True, 'proxies': results})
-
-# ==================== GZIP COMPRESSION ====================
-@app.after_request
-def add_header(response):
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    if request.headers.get('Accept-Encoding', '').find('gzip') >= 0:
-        response.headers['Content-Encoding'] = 'gzip'
-    return response
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
